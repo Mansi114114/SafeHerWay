@@ -14,6 +14,10 @@ prediction carries a calibrated confidence *and* a separate map-coverage
 score, because the model can be perfectly sure about a place OSM barely
 covers — and you deserve to know when that is the case.
 
+**Smart Escort Mode** turns a planned walk into a live one a trusted
+contact can follow, with a one-tap SOS and periodic "still okay?"
+check-ins — no account needed on either end. See [below](#smart-escort-mode).
+
 ---
 
 ## Quick start
@@ -150,20 +154,21 @@ app/
   model_card.py    renders artifacts/model_card.md
   explain.py       SHAP contributions (+ fallback) and grouped reasons
   external_apis.py weather + traffic, each with a fallback path
-  service.py       SafeRouteService — the whole pipeline behind one class
+  service.py       SafeRouteService — the whole pipeline, incl. Escort sessions
   security.py      constant-time API-key check
-  main.py          FastAPI app
+  main.py          FastAPI app (predict/feedback routes + /escort/*)
 web/               React + Vite front end
-  src/routes/      Landing, Planner
+  src/routes/      Landing, Planner, EscortView (the companion's read-only page)
   src/components/  PlaceField, TimeChoice, RouteChoices, RouteDetail,
-                   SegmentList, CommunityPanel, RouteMap, SafetyKit, …
-  src/hooks/       useHealth, useRouteSearch
+                   SegmentList, CommunityPanel, RouteMap, SafetyKit,
+                   WalkingHUD, CompanionShare, …
+  src/hooks/       useHealth, useRouteSearch, useEscort, useAlertNotice
   src/lib/         api, routing, places, storage, config, format
   src/styles/      tokens, base, landing, planner
 fetch_osm_data.py  offline: download + aggregate the OSM extract
 train_model.py     offline: build dataset, train, write the model card
 cli.py             info / predict / compare / feedback / nearby / metrics
-tests/             158 tests, hermetic, ~10s
+tests/             176 tests, hermetic, ~10s
 ```
 
 `SafeRouteService` is the single entry point to the pipeline; the API and
@@ -190,10 +195,24 @@ dev-key-456
 | POST | `/feedback` | Submit a crowdsourced safety audit |
 | GET | `/audits/nearby` | Audits within a radius of a point |
 | POST | `/audits/along-route` | Audits within reach of any point on a route, newest first |
+| POST | `/escort/start` | Begin a live-tracking session (Smart Escort Mode) |
+| POST | `/escort/{trip_id}/position` | Push the walker's current point + score |
+| POST | `/escort/{trip_id}/checkin` | Answer a periodic "still okay?" prompt |
+| POST | `/escort/{trip_id}/missed-checkin` | Client-reported: a check-in prompt timed out unanswered |
+| POST | `/escort/{trip_id}/sos` | One-tap distress signal — flips the session to `alert` immediately |
+| POST | `/escort/{trip_id}/end` | Arrived safely — close out the session |
+| GET | `/escort/{trip_id}` | Companion's read-only status — **no `x-api-key` needed** |
 
 `/feedback` accepts an optional `reasons` list drawn from a fixed vocabulary
 (`poorly_lit`, `well_lit`, `isolated`, `busy`, `harassment`, `followed`,
 `police_presence`, `broken_footpath`, `construction`, `stray_dogs`, `other`).
+
+Every `/escort/*` write needs both the app's own `x-api-key` *and* the
+session's `owner_token`, a second secret that never leaves the walker's
+browser — so anyone with only the share link can watch a trip but never
+end it, post to it, or fake an "I'm OK". `GET /escort/{trip_id}` is the one
+deliberately unauthenticated route in the whole API: it's what lets the
+companion page open from nothing but the link itself.
 
 ```bash
 curl -X POST http://localhost:8000/predict \
@@ -284,10 +303,45 @@ key. Put it in `web/.env.local` as `VITE_ORS_KEY`, or load the page once with
 
 ---
 
+## Smart Escort Mode
+
+A planned walk can be turned into a live one: start a session from the
+Walking HUD and a trusted contact can follow along on a page of their own —
+no account, no app install, just the link.
+
+- **Start:** `CompanionShare` calls `/escort/start` and gets back an
+  unguessable `trip_id` (safe to text or share) plus a private `owner_token`
+  that stays in the walker's browser and is required for every write.
+- **While walking:** the current point, live risk score, and route progress
+  are pushed to the session in the background (`useEscort`), throttled the
+  same way as live rescoring — no more than one update per ~20s / 40m of
+  movement.
+- **Check-ins:** every `check_in_interval_seconds` (10 min by default,
+  60s–1h configurable) the walker gets a "still okay?" prompt. Answering
+  posts to `/escort/{trip_id}/checkin`; letting it time out posts to
+  `/escort/{trip_id}/missed-checkin` and flips the session to `alert`.
+- **SOS:** one tap posts to `/escort/{trip_id}/sos` and flips the session to
+  `alert` immediately, no check-in wait required.
+- **The companion's page** (`EscortView`, opened from the share link) polls
+  `GET /escort/{trip_id}` — the one unauthenticated route in the API — and
+  shows status, last-known point on the map, and the session's event
+  timeline. `useAlertNotice` makes the switch to `alert` hard to miss: a
+  browser notification, an audible beep, and a flashing tab title, so a
+  glance at the tab bar is enough even if they've looked away. None of this
+  can reach someone with the tab fully closed — that would need server-push,
+  which this project doesn't have yet.
+- **Sessions are ephemeral by design.** They live in memory only (not on
+  disk) and expire after `SAFEROUTE_ESCORT_TTL_SECONDS` (6 hours by
+  default) — a session is meant to outlive one walk, not a server restart,
+  and persisting live-location data by default felt like the wrong choice
+  for a safety app.
+
+---
+
 ## Tests
 
 ```bash
-pytest -q        # 158 tests, ~10s
+pytest -q        # 176 tests, ~10s
 ```
 
 The suite runs against the synthetic city on a shrunken grid in a temporary
@@ -303,8 +357,10 @@ shares a cell between parts; that ECE catches overconfidence; that log loss
 and `predict_proba` respect our class order rather than sklearn's
 alphabetical one; that the model stays within its noise ceiling and its mean
 confidence tracks its accuracy; that a failing weather API can't break a
-prediction; that audit adjustments survive a restart; and the full HTTP
-contract including auth, validation and error codes.
+prediction; that audit adjustments survive a restart; the full HTTP
+contract including auth, validation and error codes; and the Escort session
+lifecycle — start, position updates, check-ins, missed check-ins, SOS, and
+that the `owner_token` is genuinely required for every write.
 
 ---
 
@@ -321,6 +377,7 @@ contract including auth, validation and error codes.
 | `SAFEROUTE_OVERPASS_ENDPOINTS` | three public mirrors | Overpass mirrors, tried in order |
 | `SAFEROUTE_LABEL_TEMPERATURE` | `0.03` | Width of the ambiguous band when sampling labels |
 | `SAFEROUTE_SEED` | `42` | Random seed |
+| `SAFEROUTE_ESCORT_TTL_SECONDS` | `21600` (6 h) | How long an Escort Mode session lives before it expires |
 
 Front-end variables live in `web/.env.local`:
 
@@ -329,6 +386,22 @@ Front-end variables live in `web/.env.local`:
 | `VITE_ORS_KEY` | OpenRouteService key for pedestrian routing |
 | `VITE_API_BASE_URL` | Pin the backend instead of auto-detecting it |
 | `VITE_API_KEY` | Backend API key (defaults to `demo-key-123`) |
+
+---
+
+## Deployment
+
+The backend is a [Render](https://render.com) Blueprint: `render.yaml`
+installs `requirements.txt`, runs `train_model.py` at build time, and starts
+`uvicorn` on Render's assigned `$PORT`, with `/health` wired up as the
+health check. Set `SAFEROUTE_API_KEYS` and `SAFEROUTE_CORS_ORIGINS` in the
+Render dashboard (marked `sync: false` in the blueprint on purpose).
+
+The web app deploys to [Vercel](https://vercel.com) as a static build
+(`web/vercel.json` rewrites every path to `index.html`, which client-side
+routes like `/escort/:tripId` need on a hard refresh). Point
+`VITE_API_BASE_URL` at the deployed backend and set `VITE_ORS_KEY` in
+Vercel's project environment variables.
 
 ---
 
